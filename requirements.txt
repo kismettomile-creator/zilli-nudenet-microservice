@@ -11,9 +11,9 @@ httpx==0.25.2
 
 # NudeNet and image processing dependencies
 nudenet==3.4.2
-Pillow==10.1.0
-opencv-python==4.8.1.78
-numpy==1.24.4
+Pillow==10.2.0
+opencv-python==4.9.0.80
+numpy==1.26.4
 
 # Async utilities
 asyncio-mqtt==0.16.1
