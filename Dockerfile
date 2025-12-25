@@ -17,5 +17,5 @@ RUN pip install -r requirements.txt
 # Uygulama kodunu ekle
 COPY . .
 
-# Microservice'i başlat (backend ile aynı mantık)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+# Microservice'i başlat (same as backend: port 3000)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "3000", "--workers", "4"]
