@@ -12,7 +12,6 @@ import io
 from PIL import Image
 import tempfile
 import os
-import cv2
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
