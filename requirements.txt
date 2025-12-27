@@ -19,6 +19,7 @@ numpy==1.26.4
 # Age detection for child safety (18+ enforcement)
 deepface==0.0.92
 tensorflow==2.16.1
+tf-keras==2.16.0
 
 # Async utilities
 asyncio-mqtt==0.16.1
