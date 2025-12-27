@@ -127,6 +127,11 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
         try:
             image = Image.open(io.BytesIO(decoded_data))
             
+            # Convert to RGB if image has alpha channel (RGBA/LA) or other modes
+            if image.mode != 'RGB':
+                logger.debug(f"🔄 Converting image from {image.mode} to RGB")
+                image = image.convert('RGB')
+            
             # Resim boyutunu optimize et (max 800x800)
             max_size = 800
             if max(image.size) > max_size:
