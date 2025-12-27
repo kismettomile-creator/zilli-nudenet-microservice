@@ -17,7 +17,8 @@ opencv-contrib-python-headless==4.9.0.80
 numpy==1.26.4
 
 # Age detection for child safety (18+ enforcement)
-deepface==0.0.79
+deepface==0.0.92
+tensorflow==2.15.0
 
 # Async utilities
 asyncio-mqtt==0.16.1
