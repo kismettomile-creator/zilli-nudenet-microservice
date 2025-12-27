@@ -102,16 +102,16 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
     # Hassasiyet ayarlarını belirle
     if sensitivity == "high":
         nudity_threshold = 0.45
-        age_threshold = 20  # Daha güvenli: 20 yaş altı ret
-        logger.info("🔍 HIGH sensitivity mode: nudity_threshold=0.45, age_threshold=20")
+        age_threshold = 16  # Profil/story için: 16 yaş altı ret
+        logger.info("🔍 HIGH sensitivity mode: nudity_threshold=0.45, age_threshold=16")
     elif sensitivity == "low":
         nudity_threshold = 0.75
-        age_threshold = 18
-        logger.info("🔍 LOW sensitivity mode: nudity_threshold=0.75, age_threshold=18")
+        age_threshold = 16
+        logger.info("🔍 LOW sensitivity mode: nudity_threshold=0.75, age_threshold=16")
     else:  # normal
         nudity_threshold = 0.6
-        age_threshold = 18
-        logger.info("🔍 NORMAL sensitivity mode: nudity_threshold=0.6, age_threshold=18")
+        age_threshold = 16  # Video call için: 16 yaş altı ret
+        logger.info("🔍 NORMAL sensitivity mode: nudity_threshold=0.6, age_threshold=16")
     
     try:
         # Step 1: Decode base64 data (in-memory)
