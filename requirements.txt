@@ -21,6 +21,9 @@ deepface==0.0.92
 tensorflow==2.16.1
 tf-keras==2.16.0
 
+# YOLO for person detection (gender=1 için)
+ultralytics==8.3.0
+
 # Async utilities
 asyncio-mqtt==0.16.1
 
