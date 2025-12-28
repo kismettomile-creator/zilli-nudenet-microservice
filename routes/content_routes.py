@@ -58,22 +58,44 @@ def get_nude_detector():
     
     return _nude_detector
 
+# ==================== 🔥 YOLO PERSON DETECTION ====================
+_yolo_model = None
+_yolo_loading = False
+
+def get_yolo_model():
+    """🔥 Thread-safe lazy load YOLO model for person detection"""
+    global _yolo_model, _yolo_loading
+    
+    if _yolo_loading:
+        while _yolo_loading and _yolo_model is None:
+            time.sleep(0.1)
+        return _yolo_model
+    
+    if _yolo_model is None:
+        _yolo_loading = True
+        logger.info("🧠 Loading YOLO model...")
+        try:
+            from ultralytics import YOLO
+            _yolo_model = YOLO('yolov8n.pt')  # Nano model - fast
+            logger.info("✅ YOLO model loaded successfully")
+        except Exception as e:
+            logger.error(f"❌ YOLO model loading failed: {e}")
+            _yolo_model = None
+        finally:
+            _yolo_loading = False
+    
+    return _yolo_model
+
 async def warmup_nudenet():
-    """Pre-loads the NudeNet model at startup."""
-    logger.info("🔥 [WARMUP] Pre-loading NudeNet model...")
-    try:
-        import asyncio
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(content_moderation_pool, get_nude_detector)
-        logger.info("✅ [WARMUP] NudeNet model pre-loaded successfully")
-    except Exception as e:
-        logger.error(f"❌ [WARMUP] NudeNet pre-load failed: {e}")
-        raise
+    """Pre-loads the NudeNet model at startup (SKIPPED for macOS compatibility)"""
+    logger.info("🔥 [WARMUP] Skipping NudeNet pre-load (will lazy-load on first request)")
+    logger.info("✅ [WARMUP] Models will be loaded on-demand")
 
 # ==================== REQUEST/RESPONSE MODELS ====================
 class ContentModerationRequest(BaseModel):
     image_data: str  # Base64 encoded image
     sensitivity: Optional[str] = "normal"  # "high", "normal", "low"
+    gender: Optional[int] = None  # 1 = female (person detection), 0 or None = no person detection
     
 class ContentModerationResponse(BaseModel):
     nudity_detected: bool
@@ -82,20 +104,27 @@ class ContentModerationResponse(BaseModel):
     processing_time_ms: float
     image_size_kb: float
     sensitivity_used: str
+    has_person: bool = False  # True if person detected (only when gender=1)
 
 # ==================== CORE PROCESSING FUNCTIONS ====================
-def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "normal"):
+def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "normal", gender: int = None):
     """
-    🔥 OPTIMIZED: In-memory NudeNet detection + 18+ Age Verification
+    🔥 OPTIMIZED: In-memory NudeNet detection + 18+ Age Verification + Person Detection
     
     ⚠️⚠️⚠️ CHILD SAFETY: 18 YAŞ ALTI TESPİT EDİLİRSE NOT SAFE! ⚠️⚠️⚠️
     - Bebek, çocuk, teenager → NOT SAFE (nudity_detected=True)
     - 18 yaş altı herhangi bir kişi → NOT SAFE
     
+    🧍 PERSON DETECTION (YOLO):
+    - gender=1 ise YOLO person detection aktif
+    - NudeNet OR YOLO → has_person=True
+    
     Sensitivity modes:
     - "high": Profil fotoğrafı/story için - nudity threshold: 0.45, yaş threshold: 20
     - "normal": Video call için - nudity threshold: 0.6, yaş threshold: 18
     - "low": Daha toleranslı - nudity threshold: 0.75, yaş threshold: 18
+    
+    Returns: (image_size_kb, nudity_detected, confidence_score, detection_details, has_person)
     """
     start_time = time.time()
     
@@ -127,10 +156,21 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
         try:
             image = Image.open(io.BytesIO(decoded_data))
             
-            # Convert to RGB if image has alpha channel (RGBA/LA) or other modes
+            # Convert to RGB if image has alpha channel (RGBA/LA/P) or other modes
             if image.mode != 'RGB':
                 logger.debug(f"🔄 Converting image from {image.mode} to RGB")
-                image = image.convert('RGB')
+                if image.mode in ('RGBA', 'LA'):
+                    # PNG transparency fix
+                    background = Image.new('RGB', image.size, (255, 255, 255))
+                    background.paste(image, mask=image.split()[-1])
+                    image = background
+                elif image.mode == 'P':
+                    image = image.convert('RGBA')
+                    background = Image.new('RGB', image.size, (255, 255, 255))
+                    background.paste(image, mask=image.split()[-1])
+                    image = background
+                else:
+                    image = image.convert('RGB')
             
             # Resim boyutunu optimize et (max 800x800)
             max_size = 800
@@ -140,7 +180,41 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
             np_array = np.array(image)
         except Exception as e:
             logger.error(f"❌ Image loading error: {e}")
-            return image_size_kb, False, 0.0, f"Image load failed: {str(e)}"
+            return image_size_kb, False, 0.0, f"Image load failed: {str(e)}", False
+        
+        # ========== YOLO PERSON DETECTION (sadece gender=1 için) ==========
+        yolo_has_person = False
+        person_count = 0
+        
+        if gender == 1:
+            try:
+                yolo_model = get_yolo_model()
+                if yolo_model:
+                    logger.info("🔍 [YOLO] Person detection (gender=1)...")
+                    
+                    # Geçici dosyaya kaydet (YOLO file path gerektirir)
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                        temp_path = tmp.name
+                        image.save(temp_path, quality=95)
+                    
+                    try:
+                        results = yolo_model(temp_path, verbose=False)
+                        
+                        for result in results:
+                            for box in result.boxes:
+                                if int(box.cls) == 0:  # class 0 = person
+                                    person_count += 1
+                        
+                        yolo_has_person = person_count > 0
+                        logger.info(f"👤 [YOLO] {person_count} person(s) detected, has_person={yolo_has_person}")
+                    finally:
+                        # Cleanup temp file
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                            
+            except Exception as e:
+                logger.warning(f"⚠️ [YOLO] Detection failed: {e}")
         
         # ⚠️⚠️⚠️ STEP 2A: 18 YAŞ ALTI KONTROLÜ (ÖNCELİKLİ!) ⚠️⚠️⚠️
         underage_detected = False
@@ -177,7 +251,9 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
                     logger.warning(f"🚨 [AGE_CHECK] {age_details}")
                     
                     # Yaş eşiği altı tespit edildi → NOT SAFE!
-                    return image_size_kb, True, 1.0, age_details
+                    # has_person: gender=1 için NudeNet OR YOLO (age check passed olsa bile)
+                    final_has_person = yolo_has_person if gender == 1 else False
+                    return image_size_kb, True, 1.0, age_details, final_has_person
                 else:
                     logger.info(f"✅ [AGE_CHECK] Age verification passed: {estimated_age} >= {age_threshold}")
                     age_details = f"Age OK: {estimated_age}"
@@ -210,6 +286,15 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
             high_confidence_detections = []
             max_confidence = 0.0
             
+            # NudeNet'te herhangi bir tespit varsa insan var demektir
+            nudenet_has_person = len(detections) > 0
+            
+            # Final has_person (NudeNet OR YOLO) - sadece gender=1 için
+            has_person = False
+            if gender == 1:
+                has_person = nudenet_has_person or yolo_has_person
+                logger.info(f"🧍 [PERSON] NudeNet={nudenet_has_person}, YOLO={yolo_has_person}, Final={has_person}")
+            
             for detection in detections:
                 class_name = detection['class']
                 confidence = detection['score']
@@ -236,47 +321,54 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
                 
         except Exception as e:
             logger.error(f"❌ NudeNet detection error: {e}")
-            return image_size_kb, False, 0.0, f"Detection failed: {str(e)}"
+            final_has_person = yolo_has_person if gender == 1 else False
+            return image_size_kb, False, 0.0, f"Detection failed: {str(e)}", final_has_person
         
         processing_time = (time.time() - start_time) * 1000  # Convert to milliseconds
         logger.info(f"⚡ Content moderation completed in {processing_time:.1f}ms")
         
-        return image_size_kb, nudity_detected, confidence_score, detection_details
+        return image_size_kb, nudity_detected, confidence_score, detection_details, has_person
         
     except Exception as e:
         logger.error(f"❌ Content moderation general error: {e}")
-        return 0.0, False, 0.0, f"Processing failed: {str(e)}"
+        return 0.0, False, 0.0, f"Processing failed: {str(e)}", False
 
 # ==================== API ENDPOINTS ====================
 @router.post("/detect", response_model=ContentModerationResponse)
 async def detect_nudity(request: ContentModerationRequest):
     """
-    🔥 NudeNet Content Moderation Endpoint + 18+ Age Verification
+    🔥 NudeNet Content Moderation Endpoint + 18+ Age Verification + Person Detection
     
     Ana API'den gelen base64 image'ı analiz eder.
     ⚠️ CHILD SAFETY: Yaş eşiği altı tespit edilirse NOT SAFE döner!
+    🧍 PERSON DETECTION: gender=1 ise YOLO person detection aktif
     
     Sensitivity modes:
     - "high": Profil fotoğrafı/story için - Daha sıkı kontrol (nudity: 0.45, age: 20)
     - "normal": Video call için - Standart kontrol (nudity: 0.6, age: 18)
     - "low": Daha toleranslı kontrol (nudity: 0.75, age: 18)
     
+    Gender parameter:
+    - gender=1: YOLO person detection aktif, has_person döner (NudeNet OR YOLO)
+    - gender=0 veya None: YOLO çalışmaz, has_person=False döner
+    
     Tam optimizasyon: in-memory processing, dedicated thread pool.
     """
     start_time = time.time()
     
     try:
-        logger.info(f"🔍 Starting content moderation process (sensitivity: {request.sensitivity})...")
+        logger.info(f"🔍 Starting content moderation (sensitivity: {request.sensitivity}, gender: {request.gender})...")
         
-        # Run NudeNet detection + Age verification in dedicated thread pool (non-blocking)
+        # Run NudeNet detection + Age verification + Person detection in dedicated thread pool (non-blocking)
         import asyncio
         loop = asyncio.get_event_loop()
         
-        image_size_kb, nudity_detected, confidence_score, detection_details = await loop.run_in_executor(
+        image_size_kb, nudity_detected, confidence_score, detection_details, has_person = await loop.run_in_executor(
             content_moderation_pool, 
             _sync_process_image_optimized,
             request.image_data,
-            request.sensitivity  # ⚡ Hassasiyet parametresi eklendi
+            request.sensitivity,
+            request.gender  # ⚡ Gender parametresi eklendi
         )
         
         processing_time_ms = (time.time() - start_time) * 1000
@@ -287,12 +379,14 @@ async def detect_nudity(request: ContentModerationRequest):
             detection_details=detection_details,
             processing_time_ms=processing_time_ms,
             image_size_kb=image_size_kb,
-            sensitivity_used=request.sensitivity  # ⚡ Kullanılan hassasiyet
+            sensitivity_used=request.sensitivity,
+            has_person=has_person  # ⚡ Person detection sonucu
         )
         
         # Log result
         status = "🚨 BLOCKED" if nudity_detected else "✅ SAFE"
-        logger.info(f"{status} [{request.sensitivity.upper()}] - Processing: {processing_time_ms:.1f}ms, Size: {image_size_kb:.1f}KB, Confidence: {confidence_score:.2f}")
+        person_status = f", has_person={has_person}" if request.gender == 1 else ""
+        logger.info(f"{status} [{request.sensitivity.upper()}] - Processing: {processing_time_ms:.1f}ms, Size: {image_size_kb:.1f}KB, Confidence: {confidence_score:.2f}{person_status}")
         
         return response
         
@@ -305,7 +399,8 @@ async def detect_nudity(request: ContentModerationRequest):
             detection_details=f"Error: {str(e)}",
             processing_time_ms=(time.time() - start_time) * 1000,
             image_size_kb=0.0,
-            sensitivity_used=request.sensitivity
+            sensitivity_used=request.sensitivity,
+            has_person=False
         )
 
 @router.get("/health")
