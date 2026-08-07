@@ -21,6 +21,14 @@ deepface==0.0.92
 tensorflow==2.16.1
 tf-keras==2.16.0
 
+# InsightFace - 2. bağımsız yaş tahmin kaynağı (çift SDK doğrulama için, DeepFace'ten farklı mimari/ONNX tabanlı)
+# Model ağırlıkları repo'ya commitlenmiyor, ilk çağrıda otomatik indiriliyor (~/.insightface)
+insightface==0.7.3
+onnxruntime==1.17.1
+# onnx pin ZORUNLU: pinlenmezse insightface en yeni onnx'i çeker, o da tensorflow==2.16.1'in
+# gerektirdiği ml_dtypes~0.3.x ile çakışıp import hatası veriyor (yerelde doğrulandı)
+onnx==1.16.1
+
 # YOLO for person detection (gender=1 için)
 ultralytics==8.3.0
 

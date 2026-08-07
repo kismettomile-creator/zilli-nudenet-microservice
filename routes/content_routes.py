@@ -86,6 +86,63 @@ def get_yolo_model():
     
     return _yolo_model
 
+# ==================== 🔥 INSIGHTFACE AGE ESTIMATION (2. bağımsız yaş kaynağı) ====================
+# DeepFace'ten bağımsız, farklı bir mimari (ONNX tabanlı) - yaş tahmininde çift doğrulama için.
+# Model ağırlıkları repo'ya commitlenmiyor, ilk çağrıda otomatik indiriliyor (~/.insightface).
+# Sadece HER İKİ SDK de yaş eşiğinin altında derse underage kabul edilir (yanlış pozitifi azaltmak için).
+_insightface_app = None
+_insightface_loading = False
+
+def get_insightface_app():
+    """🔥 Thread-safe lazy load InsightFace (buffalo_l) - DeepFace'ten bağımsız 2. yaş kaynağı"""
+    global _insightface_app, _insightface_loading
+
+    if _insightface_loading:
+        while _insightface_loading and _insightface_app is None:
+            time.sleep(0.1)
+        return _insightface_app
+
+    if _insightface_app is None:
+        _insightface_loading = True
+        logger.info("🧠 Loading InsightFace (buffalo_l) model...")
+        try:
+            from insightface.app import FaceAnalysis
+            _insightface_app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+            _insightface_app.prepare(ctx_id=0, det_size=(640, 640))
+            logger.info("✅ InsightFace model loaded successfully")
+        except Exception as e:
+            logger.error(f"❌ InsightFace model loading failed: {e}")
+            _insightface_app = None
+        finally:
+            _insightface_loading = False
+
+    return _insightface_app
+
+
+def _check_insightface_age(np_array) -> Optional[float]:
+    """
+    InsightFace (buffalo_l) ile yüzden yaş tahmini yapar - DeepFace'ten bağımsız 2. kaynak.
+
+    Returns:
+        estimated_age (float) veya None (yüz bulunamazsa / model yüklenemezse)
+    """
+    try:
+        app = get_insightface_app()
+        if app is None:
+            return None
+
+        faces = app.get(np_array)
+        if not faces:
+            return None
+
+        # Birden fazla yüz varsa en büyüğünü (kameraya en yakın kişiyi) al
+        largest_face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        return float(largest_face.age)
+    except Exception as e:
+        logger.warning(f"⚠️ [INSIGHTFACE_AGE] Detection failed: {e}")
+        return None
+
+
 # ==================== 🔥 FALCONSAI NSFW CLASSIFIER (2. bağımsız kaynak) ====================
 # Sadece sensitivity="high" (profil fotoğrafı / story) durumunda NudeNet'e ek olarak
 # çalışır - NudeNet'in kaçırdığı içerikleri yakalamak için OR mantığıyla eklenir.
@@ -352,17 +409,18 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
             except Exception as e:
                 logger.warning(f"⚠️ [YOLO] Detection failed: {e}")
         
-        # ⚠️⚠️⚠️ STEP 2A: 18 YAŞ ALTI KONTROLÜ (ÖNCELİKLİ!) ⚠️⚠️⚠️
+        # ⚠️⚠️⚠️ STEP 2A: 18 YAŞ ALTI KONTROLÜ (ÇİFT SDK DOĞRULAMALI!) ⚠️⚠️⚠️
+        # DeepFace ve InsightFace birbirinden bağımsız iki farklı model/mimari.
+        # Yanlış pozitifi azaltmak için: sadece İKİSİ DE eşik altı derse underage kabul edilir.
         underage_detected = False
         age_details = ""
-        
+        deepface_age = None
+        insightface_age = None
+
         try:
             from deepface import DeepFace
-            
-            # DeepFace ile yaş tahmini yap
-            logger.info("🔍 [AGE_CHECK] Analyzing age...")
-            
-            # Yüz tespit et ve yaş tahmin et
+
+            logger.info("🔍 [AGE_CHECK] Analyzing age (DeepFace)...")
             analysis = DeepFace.analyze(
                 img_path=np_array,
                 actions=['age'],
@@ -370,39 +428,49 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
                 detector_backend='opencv',  # Hızlı detector
                 silent=True
             )
-            
+
             # Analysis sonucunu kontrol et (list veya dict olabilir)
             if isinstance(analysis, list):
                 analysis = analysis[0] if analysis else {}
-            
-            estimated_age = analysis.get('age', None)
-            
-            if estimated_age is not None:
-                logger.info(f"📊 [AGE_CHECK] Estimated age: {estimated_age}")
-                
-                # ⚠️ CRITICAL: Yaş kontrolü (hassasiyet moduna göre)
-                if estimated_age < age_threshold:
-                    underage_detected = True
-                    age_details = f"UNDERAGE DETECTED: Estimated age {estimated_age} (< {age_threshold})"
-                    logger.warning(f"🚨 [AGE_CHECK] {age_details}")
-                    
-                    # Yaş eşiği altı tespit edildi → NOT SAFE!
-                    # has_person: gender=1 için NudeNet OR YOLO (age check passed olsa bile)
-                    final_has_person = yolo_has_person if gender == 1 else False
-                    return image_size_kb, True, 1.0, age_details, final_has_person
-                else:
-                    logger.info(f"✅ [AGE_CHECK] Age verification passed: {estimated_age} >= {age_threshold}")
-                    age_details = f"Age OK: {estimated_age}"
+
+            deepface_age = analysis.get('age', None)
+            if deepface_age is not None:
+                logger.info(f"📊 [AGE_CHECK] DeepFace estimated age: {deepface_age}")
             else:
-                # Yüz tespit edilemedi, yaş tahmin edilemedi
-                logger.info("⚠️ [AGE_CHECK] No face detected or age could not be estimated")
-                age_details = "Age verification: No face detected"
-                
+                logger.info("⚠️ [AGE_CHECK] DeepFace: No face detected")
         except Exception as e:
             # DeepFace hatası - güvenli varsayılan olarak devam et
-            logger.warning(f"⚠️ [AGE_CHECK] Age detection failed: {e}")
-            age_details = f"Age verification failed: {str(e)}"
-            # Yaş kontrolü başarısız oldu ama nudity kontrolüne devam et
+            logger.warning(f"⚠️ [AGE_CHECK] DeepFace age detection failed: {e}")
+
+        try:
+            logger.info("🔍 [AGE_CHECK] Analyzing age (InsightFace)...")
+            insightface_age = _check_insightface_age(np_array)
+            if insightface_age is not None:
+                logger.info(f"📊 [AGE_CHECK] InsightFace estimated age: {insightface_age}")
+            else:
+                logger.info("⚠️ [AGE_CHECK] InsightFace: No face detected")
+        except Exception as e:
+            logger.warning(f"⚠️ [AGE_CHECK] InsightFace age detection failed: {e}")
+
+        # ⚠️ CRITICAL: Sadece iki SDK de bağımsız olarak eşik altı yaş tespit ederse underage kabul et
+        deepface_flags_underage = deepface_age is not None and deepface_age < age_threshold
+        insightface_flags_underage = insightface_age is not None and insightface_age < age_threshold
+
+        if deepface_flags_underage and insightface_flags_underage:
+            underage_detected = True
+            age_details = f"UNDERAGE DETECTED (dual-verified): DeepFace={deepface_age}, InsightFace={insightface_age} (< {age_threshold})"
+            logger.warning(f"🚨 [AGE_CHECK] {age_details}")
+
+            # Yaş eşiği altı tespit edildi → NOT SAFE!
+            # has_person: gender=1 için NudeNet OR YOLO (age check passed olsa bile)
+            final_has_person = yolo_has_person if gender == 1 else False
+            return image_size_kb, True, 1.0, age_details, final_has_person
+        elif deepface_age is not None and insightface_age is not None:
+            age_details = f"Age OK (dual-checked): DeepFace={deepface_age}, InsightFace={insightface_age}"
+            logger.info(f"✅ [AGE_CHECK] {age_details}")
+        else:
+            age_details = "Age verification: face not confirmed by both sources"
+            logger.info(f"⚠️ [AGE_CHECK] {age_details}")
         
         # Step 3: NudeNet ile nudity detection (yaş 18+ onaylandıysa)
         nudity_detected = False
