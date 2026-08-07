@@ -24,7 +24,10 @@ tf-keras==2.16.0
 # InsightFace - 2. bağımsız yaş tahmin kaynağı (çift SDK doğrulama için, DeepFace'ten farklı mimari/ONNX tabanlı)
 # Model ağırlıkları repo'ya commitlenmiyor, ilk çağrıda otomatik indiriliyor (~/.insightface)
 insightface==0.7.3
-onnxruntime==1.17.1
+# ⚠️ onnxruntime>=1.18 ZORUNLU: 1.17.x sadece ONNX IR version 9'a kadar destekliyor, ama
+# nudenet'in kendi model dosyası (320n.onnx) IR version 10 ile export edilmiş - 1.17.1 pini
+# NudeNet'in TAMAMEN yüklenememesine sebep oldu (production'da doğrulandı, model load hatası)
+onnxruntime==1.19.2
 # onnx pin ZORUNLU: pinlenmezse insightface en yeni onnx'i çeker, o da tensorflow==2.16.1'in
 # gerektirdiği ml_dtypes~0.3.x ile çakışıp import hatası veriyor (yerelde doğrulandı)
 onnx==1.16.1
