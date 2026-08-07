@@ -24,6 +24,9 @@ tf-keras==2.16.0
 # YOLO for person detection (gender=1 için)
 ultralytics==8.3.0
 
+# Falconsai NSFW classifier - ikinci/bağımsız nudity kontrol kaynağı (sadece "high" sensitivity)
+transformers==4.44.2
+
 # Async utilities
 asyncio-mqtt==0.16.1
 

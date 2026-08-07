@@ -86,6 +86,68 @@ def get_yolo_model():
     
     return _yolo_model
 
+# ==================== 🔥 FALCONSAI NSFW CLASSIFIER (2. bağımsız kaynak) ====================
+# Sadece sensitivity="high" (profil fotoğrafı / story) durumunda NudeNet'e ek olarak
+# çalışır - NudeNet'in kaçırdığı içerikleri yakalamak için OR mantığıyla eklenir.
+# Var olan NudeNet mantığına dokunulmaz, sadece ek bir sinyal olarak eklenir.
+_falconsai_pipeline = None
+_falconsai_loading = False
+
+FALCONSAI_NSFW_THRESHOLD = 0.5  # "nsfw" skoru bu eşiği geçerse ikinci kaynak da unsafe der
+
+def get_falconsai_classifier():
+    """🔥 Thread-safe lazy load Falconsai NSFW classifier"""
+    global _falconsai_pipeline, _falconsai_loading
+
+    if _falconsai_loading:
+        while _falconsai_loading and _falconsai_pipeline is None:
+            time.sleep(0.1)
+        return _falconsai_pipeline
+
+    if _falconsai_pipeline is None:
+        _falconsai_loading = True
+        logger.info("🧠 Loading Falconsai NSFW classifier...")
+        try:
+            from transformers import pipeline
+            _falconsai_pipeline = pipeline(
+                "image-classification",
+                model="Falconsai/nsfw_image_detection"
+            )
+            logger.info("✅ Falconsai NSFW classifier loaded successfully")
+        except Exception as e:
+            logger.error(f"❌ Falconsai classifier loading failed: {e}")
+            _falconsai_pipeline = None
+        finally:
+            _falconsai_loading = False
+
+    return _falconsai_pipeline
+
+
+def _check_falconsai_nsfw(image: "Image.Image"):
+    """
+    Falconsai modeliyle görseli sınıflandırır (normal/nsfw).
+
+    Returns:
+        (is_nsfw: bool, nsfw_score: float)
+    """
+    try:
+        classifier = get_falconsai_classifier()
+        if classifier is None:
+            return False, 0.0
+
+        results = classifier(image)  # [{"label": "nsfw", "score": 0.98}, {"label": "normal", "score": 0.02}]
+        nsfw_score = 0.0
+        for r in results:
+            if r.get("label", "").lower() == "nsfw":
+                nsfw_score = r.get("score", 0.0)
+                break
+
+        return nsfw_score > FALCONSAI_NSFW_THRESHOLD, nsfw_score
+    except Exception as e:
+        logger.warning(f"⚠️ [FALCONSAI] Detection failed: {e}")
+        return False, 0.0
+
+
 async def warmup_nudenet():
     """Pre-loads the NudeNet model at startup (SKIPPED for macOS compatibility)"""
     logger.info("🔥 [WARMUP] Skipping NudeNet pre-load (will lazy-load on first request)")
@@ -118,6 +180,10 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
     🧍 PERSON DETECTION (YOLO):
     - gender=1 ise YOLO person detection aktif
     - NudeNet OR YOLO → has_person=True
+
+    🔥 FALCONSAI (2. bağımsız nudity kaynağı):
+    - Sadece sensitivity="high" (profil fotoğrafı/story) durumunda çalışır
+    - NudeNet OR Falconsai → nudity_detected=True
     
     Sensitivity modes:
     - "high": Profil fotoğrafı/story için - nudity threshold: 0.45, yaş threshold: 20
@@ -323,7 +389,27 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
             logger.error(f"❌ NudeNet detection error: {e}")
             final_has_person = yolo_has_person if gender == 1 else False
             return image_size_kb, False, 0.0, f"Detection failed: {str(e)}", final_has_person
-        
+
+        # ========== 🔥 FALCONSAI NSFW (2. bağımsız kaynak) - SADECE "high" sensitivity'de ==========
+        # Profil fotoğrafı / story kontrolünde NudeNet'e ek olarak çalışır (OR mantığı).
+        # Video call ("normal") ve "low" modlarında çalışmaz - performans için.
+        if sensitivity == "high":
+            try:
+                falconsai_is_nsfw, falconsai_score = _check_falconsai_nsfw(image)
+                logger.info(f"🔍 [FALCONSAI] is_nsfw={falconsai_is_nsfw}, score={falconsai_score:.2f}")
+
+                if falconsai_is_nsfw:
+                    confidence_score = max(confidence_score, falconsai_score)
+                    if not nudity_detected:
+                        # NudeNet kaçırdı ama Falconsai yakaladı -> OR mantığı
+                        nudity_detected = True
+                        detection_details = f"{detection_details} | Falconsai NSFW detected (score: {falconsai_score:.2f})"
+                        logger.warning(f"🚨 [FALCONSAI] Flagged content NudeNet missed (score: {falconsai_score:.2f})")
+                    else:
+                        detection_details = f"{detection_details} | Falconsai confirmed (score: {falconsai_score:.2f})"
+            except Exception as e:
+                logger.warning(f"⚠️ [FALCONSAI] Check skipped due to error: {e}")
+
         processing_time = (time.time() - start_time) * 1000  # Convert to milliseconds
         logger.info(f"⚡ Content moderation completed in {processing_time:.1f}ms")
         
