@@ -148,6 +148,73 @@ def _check_falconsai_nsfw(image: "Image.Image"):
         return False, 0.0
 
 
+# ==================== 🔥 OPENAI MODERATION (3. bağımsız kaynak) ====================
+# Sadece sensitivity="high" durumunda, NudeNet + Falconsai'ye ek olarak çalışır.
+# omni-moderation-latest endpoint'i OpenAI tarafında ücretsiz (ayrı bir kota harcamaz).
+# Backend'deki services/ai_bot_service_t1.py ile aynı key (aynı desen: env var + statik fallback).
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
+
+_openai_client = None
+_openai_client_loading = False
+
+OPENAI_SEXUAL_THRESHOLD = 0.5  # "sexual" skoru bu eşiği geçerse üçüncü kaynak da unsafe der
+
+def get_openai_moderation_client():
+    """🔥 Thread-safe lazy load OpenAI client (moderation endpoint ücretsiz)"""
+    global _openai_client, _openai_client_loading
+
+    if _openai_client_loading:
+        while _openai_client_loading and _openai_client is None:
+            time.sleep(0.1)
+        return _openai_client
+
+    if _openai_client is None:
+        _openai_client_loading = True
+        try:
+            from openai import OpenAI
+            _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+            logger.info("✅ OpenAI moderation client initialized")
+        except Exception as e:
+            logger.error(f"❌ OpenAI moderation client init failed: {e}")
+            _openai_client = None
+        finally:
+            _openai_client_loading = False
+
+    return _openai_client
+
+
+def _check_openai_moderation(image: "Image.Image"):
+    """
+    OpenAI omni-moderation-latest ile görseli sınıflandırır (ücretsiz endpoint).
+
+    Returns:
+        (is_nsfw: bool, sexual_score: float)
+    """
+    try:
+        client = get_openai_moderation_client()
+        if client is None:
+            return False, 0.0
+
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=90)
+        b64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        response = client.moderations.create(
+            model="omni-moderation-latest",
+            input=[
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_str}"}}
+            ]
+        )
+        result = response.results[0]
+        sexual_score = result.category_scores.sexual
+        is_nsfw = bool(result.categories.sexual) or sexual_score > OPENAI_SEXUAL_THRESHOLD
+
+        return is_nsfw, sexual_score
+    except Exception as e:
+        logger.warning(f"⚠️ [OPENAI_MODERATION] Detection failed: {e}")
+        return False, 0.0
+
+
 async def warmup_nudenet():
     """Pre-loads the NudeNet model at startup (SKIPPED for macOS compatibility)"""
     logger.info("🔥 [WARMUP] Skipping NudeNet pre-load (will lazy-load on first request)")
@@ -181,10 +248,10 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
     - gender=1 ise YOLO person detection aktif
     - NudeNet OR YOLO → has_person=True
 
-    🔥 FALCONSAI (2. bağımsız nudity kaynağı):
-    - Sadece sensitivity="high" (profil fotoğrafı/story) durumunda çalışır
-    - NudeNet OR Falconsai → nudity_detected=True
-    
+    🔥 FALCONSAI + OPENAI MODERATION (2. ve 3. bağımsız nudity kaynağı):
+    - İkisi de sadece sensitivity="high" (profil fotoğrafı/story) durumunda çalışır
+    - NudeNet OR Falconsai OR OpenAI Moderation → nudity_detected=True
+
     Sensitivity modes:
     - "high": Profil fotoğrafı/story için - nudity threshold: 0.45, yaş threshold: 20
     - "normal": Video call için - nudity threshold: 0.6, yaş threshold: 18
@@ -409,6 +476,24 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
                         detection_details = f"{detection_details} | Falconsai confirmed (score: {falconsai_score:.2f})"
             except Exception as e:
                 logger.warning(f"⚠️ [FALCONSAI] Check skipped due to error: {e}")
+
+            # ========== 🔥 OPENAI MODERATION (3. bağımsız kaynak) - SADECE "high" sensitivity'de ==========
+            # Ücretsiz endpoint, NudeNet + Falconsai'ye ek üçüncü doğrulayıcı (OR mantığı).
+            try:
+                openai_is_nsfw, openai_score = _check_openai_moderation(image)
+                logger.info(f"🔍 [OPENAI_MODERATION] is_nsfw={openai_is_nsfw}, score={openai_score:.2f}")
+
+                if openai_is_nsfw:
+                    confidence_score = max(confidence_score, openai_score)
+                    if not nudity_detected:
+                        # NudeNet ve Falconsai kaçırdı ama OpenAI yakaladı -> OR mantığı
+                        nudity_detected = True
+                        detection_details = f"{detection_details} | OpenAI Moderation NSFW detected (score: {openai_score:.2f})"
+                        logger.warning(f"🚨 [OPENAI_MODERATION] Flagged content others missed (score: {openai_score:.2f})")
+                    else:
+                        detection_details = f"{detection_details} | OpenAI Moderation confirmed (score: {openai_score:.2f})"
+            except Exception as e:
+                logger.warning(f"⚠️ [OPENAI_MODERATION] Check skipped due to error: {e}")
 
         processing_time = (time.time() - start_time) * 1000  # Convert to milliseconds
         logger.info(f"⚡ Content moderation completed in {processing_time:.1f}ms")

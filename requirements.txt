@@ -27,6 +27,9 @@ ultralytics==8.3.0
 # Falconsai NSFW classifier - ikinci/bağımsız nudity kontrol kaynağı (sadece "high" sensitivity)
 transformers==4.44.2
 
+# OpenAI Moderation API - üçüncü/bağımsız nudity kontrol kaynağı (ücretsiz endpoint, sadece "high" sensitivity)
+openai==1.51.0
+
 # Async utilities
 asyncio-mqtt==0.16.1
 
