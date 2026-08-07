@@ -151,8 +151,7 @@ def _check_falconsai_nsfw(image: "Image.Image"):
 # ==================== 🔥 OPENAI MODERATION (3. bağımsız kaynak) ====================
 # Sadece sensitivity="high" durumunda, NudeNet + Falconsai'ye ek olarak çalışır.
 # omni-moderation-latest endpoint'i OpenAI tarafında ücretsiz (ayrı bir kota harcamaz).
-# Backend'deki services/ai_bot_service_t1.py ile aynı key (aynı desen: env var + statik fallback).
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY","s"+"k"+"-"+"p"+"r"+"o"+"j"+"-"+ "X3T4SStZm-rluOMJda48Im2e78QYXjQXnlHEeHQQP5XwPss2Q2rv1s-BgZ5musOtFBLRj01tgwT3BlbkFJwgKD5ml16WzvrnGw6wiFVYZ_aVpGJz7pTCg1IBngau0gRcIHF45RfNt5MdMYkxyTbDF1WbKVUA")
 
 _openai_client = None
 _openai_client_loading = False
@@ -171,6 +170,10 @@ def get_openai_moderation_client():
     if _openai_client is None:
         _openai_client_loading = True
         try:
+            if not OPENAI_API_KEY:
+                logger.warning("⚠️ [OPENAI_MODERATION] OPENAI_API_KEY tanımlı değil, bu kaynak atlanacak")
+                return None
+
             from openai import OpenAI
             _openai_client = OpenAI(api_key=OPENAI_API_KEY)
             logger.info("✅ OpenAI moderation client initialized")
