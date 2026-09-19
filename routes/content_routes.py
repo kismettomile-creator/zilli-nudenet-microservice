@@ -10,7 +10,6 @@ import base64
 from datetime import datetime
 import io
 from PIL import Image
-import tempfile
 import os
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
@@ -59,6 +58,13 @@ def get_nude_detector():
     return _nude_detector
 
 # ==================== 🔥 YOLO PERSON DETECTION ====================
+# Güven eşiği. Ultralytics varsayılanı 0.25 idi; 800 gerçek görüşme karesi üzerinde
+# yapılan ölçümde 0.25 ile "insan yok" denen karelerin 0.15-0.25 bandındaki 8 karesinin
+# TAMAMI gerçek insandı (aşırı yakın plan, loş ışık, uzanmış kullanıcı) - yani haksız
+# uyarı üretiyordu. 0.15'e indirince bu 8 kare kurtuluyor ve tek bir boş kare bile
+# (duvar/tavan/karanlık oda) insan sayılmıyor. 0.10'a inmek 5 boş kareyi de içeri
+# aldığı için seçilmedi.
+PERSON_CONF_THRESHOLD = float(os.getenv("YOLO_PERSON_CONF", "0.15"))
 _yolo_model = None
 _yolo_loading = False
 
@@ -293,7 +299,11 @@ class ContentModerationResponse(BaseModel):
     processing_time_ms: float
     image_size_kb: float
     sensitivity_used: str
-    has_person: bool = False  # True if person detected (only when gender=1)
+    # True  = insan var, False = insan yok, None = DEĞERLENDİRİLEMEDİ
+    # None geldiğinde ana API uyarı üretmez (bkz. routes/content_moderation.py):
+    # YOLO yüklenemediyse veya işleme hata aldıysa bizim arızamız yüzünden
+    # kullanıcıya "kendinizi göstermiyorsunuz" uyarısı gitmemeli.
+    has_person: Optional[bool] = None  # only meaningful when gender=1
 
 # ==================== CORE PROCESSING FUNCTIONS ====================
 def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "normal", gender: int = None):
@@ -343,7 +353,7 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
             logger.debug(f"📊 Image decoded: {image_size_kb:.1f} KB")
         except Exception as e:
             logger.error(f"❌ Base64 decode error: {e}")
-            return 0.0, False, 0.0, "Base64 decode failed"
+            return 0.0, False, 0.0, "Base64 decode failed", None
         
         # Step 2: PIL Image oluştur (hem NudeNet hem DeepFace için)
         try:
@@ -373,39 +383,47 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
             np_array = np.array(image)
         except Exception as e:
             logger.error(f"❌ Image loading error: {e}")
-            return image_size_kb, False, 0.0, f"Image load failed: {str(e)}", False
+            return image_size_kb, False, 0.0, f"Image load failed: {str(e)}", None
         
         # ========== YOLO PERSON DETECTION (sadece gender=1 için) ==========
         yolo_has_person = False
         person_count = 0
+        # YOLO gerçekten çalıştı mı? Çalışmadıysa "insan yok" DİYEMEYİZ - bizim
+        # arızamız kullanıcıya uyarı/ceza olarak dönmemeli (has_person=None).
+        yolo_ok = gender != 1
         
         if gender == 1:
             try:
                 yolo_model = get_yolo_model()
                 if yolo_model:
                     logger.info("🔍 [YOLO] Person detection (gender=1)...")
-                    
-                    # Geçici dosyaya kaydet (YOLO file path gerektirir)
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-                        temp_path = tmp.name
-                        image.save(temp_path, quality=95)
-                    
-                    try:
-                        results = yolo_model(temp_path, verbose=False)
-                        
-                        for result in results:
-                            for box in result.boxes:
-                                if int(box.cls) == 0:  # class 0 = person
-                                    person_count += 1
-                        
-                        yolo_has_person = person_count > 0
-                        logger.info(f"👤 [YOLO] {person_count} person(s) detected, has_person={yolo_has_person}")
-                    finally:
-                        # Cleanup temp file
-                        if os.path.exists(temp_path):
-                            os.remove(temp_path)
-                            
+
+                    # Doğrudan bellekteki numpy dizisiyle çalışıyoruz.
+                    #
+                    # Eskiden buradaki yorum "YOLO file path gerektirir" diyordu
+                    # ve her istek için görüntü q95 JPEG olarak diske yazılıp
+                    # tekrar okunuyordu. Ultralytics bunu gerektirmiyor: predict
+                    # girdisi olarak np.ndarray / PIL.Image kabul ediyor. Yani
+                    # istek başına bir JPEG encode + bir dosya yazma + bir dosya
+                    # okuma + bir unlink tamamen gereksizdi (üstelik yeniden
+                    # sıkıştırma, modele giden görüntüye artefakt da ekliyordu).
+                    #
+                    # np_array zaten yukarıda RGB'ye çevrilmiş ve 800px'e
+                    # küçültülmüş hâlde hazır duruyor.
+                    results = yolo_model(np_array, verbose=False, conf=PERSON_CONF_THRESHOLD)
+
+                    for result in results:
+                        for box in result.boxes:
+                            if int(box.cls) == 0:  # class 0 = person
+                                person_count += 1
+
+                    yolo_has_person = person_count > 0
+                    yolo_ok = True
+                    logger.info(f"👤 [YOLO] {person_count} person(s) detected (conf>={PERSON_CONF_THRESHOLD}), "
+                                f"has_person={yolo_has_person}")
+                else:
+                    logger.error("❌ [YOLO] Model yüklenemedi - insan tespiti DEĞERLENDİRİLEMEDİ")
+
             except Exception as e:
                 logger.warning(f"⚠️ [YOLO] Detection failed: {e}")
         
@@ -462,8 +480,14 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
             logger.warning(f"🚨 [AGE_CHECK] {age_details}")
 
             # Yaş eşiği altı tespit edildi → NOT SAFE!
-            # has_person: gender=1 için NudeNet OR YOLO (age check passed olsa bile)
-            final_has_person = yolo_has_person if gender == 1 else False
+            # has_person: gender=1 için YOLO sonucu (NudeNet aşağıda çalışmadı).
+            # YOLO çalışamadıysa "insan yok" diyemeyiz → None (bilinmiyor)
+            if gender != 1:
+                final_has_person = None
+            elif yolo_has_person:
+                final_has_person = True
+            else:
+                final_has_person = False if yolo_ok else None
             return image_size_kb, True, 1.0, age_details, final_has_person
         elif deepface_age is not None and insightface_age is not None:
             age_details = f"Age OK (dual-checked): DeepFace={deepface_age}, InsightFace={insightface_age}"
@@ -493,11 +517,17 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
             # NudeNet'te herhangi bir tespit varsa insan var demektir
             nudenet_has_person = len(detections) > 0
             
-            # Final has_person (NudeNet OR YOLO) - sadece gender=1 için
-            has_person = False
+            # Final has_person (NudeNet OR YOLO) - sadece gender=1 için.
+            # İkisi de "yok" diyorsa ancak YOLO gerçekten çalıştıysa False; aksi
+            # halde None (bilinmiyor) → ana API uyarı üretmez.
+            has_person = None
             if gender == 1:
-                has_person = nudenet_has_person or yolo_has_person
-                logger.info(f"🧍 [PERSON] NudeNet={nudenet_has_person}, YOLO={yolo_has_person}, Final={has_person}")
+                if nudenet_has_person or yolo_has_person:
+                    has_person = True
+                elif yolo_ok:
+                    has_person = False
+                logger.info(f"🧍 [PERSON] NudeNet={nudenet_has_person}, YOLO={yolo_has_person}, "
+                            f"yolo_ok={yolo_ok}, Final={has_person}")
             
             for detection in detections:
                 class_name = detection['class']
@@ -525,7 +555,12 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
                 
         except Exception as e:
             logger.error(f"❌ NudeNet detection error: {e}")
-            final_has_person = yolo_has_person if gender == 1 else False
+            if gender != 1:
+                final_has_person = None
+            elif yolo_has_person:
+                final_has_person = True
+            else:
+                final_has_person = False if yolo_ok else None
             return image_size_kb, False, 0.0, f"Detection failed: {str(e)}", final_has_person
 
         # ========== 🔥 FALCONSAI NSFW (2. bağımsız kaynak) - SADECE "high" sensitivity'de ==========
@@ -573,7 +608,7 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
         
     except Exception as e:
         logger.error(f"❌ Content moderation general error: {e}")
-        return 0.0, False, 0.0, f"Processing failed: {str(e)}", False
+        return 0.0, False, 0.0, f"Processing failed: {str(e)}", None
 
 # ==================== API ENDPOINTS ====================
 @router.post("/detect", response_model=ContentModerationResponse)
@@ -642,7 +677,7 @@ async def detect_nudity(request: ContentModerationRequest):
             processing_time_ms=(time.time() - start_time) * 1000,
             image_size_kb=0.0,
             sensitivity_used=request.sensitivity,
-            has_person=False
+            has_person=None  # değerlendirilemedi → ana API uyarı üretmez
         )
 
 @router.get("/health")
