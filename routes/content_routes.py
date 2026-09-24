@@ -68,6 +68,27 @@ PERSON_CONF_THRESHOLD = float(os.getenv("YOLO_PERSON_CONF", "0.15"))
 _yolo_model = None
 _yolo_loading = False
 
+# ==================== 🔞 YAŞ POLİTİKASI ====================
+# ⚠️ İKİ AYRI POLİTİKA - profil/story ile görüşme içi kareler aynı davranmaz:
+#
+#  sensitivity="high"  (profil fotoğrafı / story)  → eşik AGE_THRESHOLD_HIGH, kural "any"
+#      Kaynaklardan HERHANGİ BİRİ eşik altı derse şüpheli sayılır. Yanlış pozitif
+#      maliyeti düşük: fotoğraf zaten canlıya çıkmıyor, admin onay kuyruğuna düşüyor.
+#
+#  sensitivity="normal"/"low"  (görüşme içi kare)  → eşik AGE_THRESHOLD_CALL, kural "dual"
+#      DeepFace VE InsightFace ikisi birden eşik altı demeli. BİLEREK DEĞİŞTİRİLMEDİ:
+#      routes/content_moderation.py bu sinyalle 2 ardışık tespitte görüşmeyi kapatıyor
+#      (main API tarafı), gevşetmek yanlışlıkla kapanan görüşmeler üretirdi.
+AGE_THRESHOLD_HIGH = int(os.getenv("AGE_THRESHOLD_HIGH", "18"))
+AGE_THRESHOLD_CALL = int(os.getenv("AGE_THRESHOLD_CALL", "16"))
+
+# 🧠 3. yaş kaynağı (MiVOLO) - VARSAYILAN KAPALI.
+# ⚠️ Açmadan önce lisans doğrulanmalı: MiVOLO ağırlıkları ticari kullanımda kısıtlı
+# olabilir. Kapalıyken hiçbir şey yüklenmez, mevcut iki kaynakla çalışmaya devam eder.
+MIVOLO_ENABLED = os.getenv("MIVOLO_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+MIVOLO_CHECKPOINT = os.getenv("MIVOLO_CHECKPOINT", "/models/mivolo_imdb.pth.tar")
+MIVOLO_DETECTOR_WEIGHTS = os.getenv("MIVOLO_DETECTOR_WEIGHTS", "/models/yolov8x_person_face.pt")
+
 def get_yolo_model():
     """🔥 Thread-safe lazy load YOLO model for person detection"""
     global _yolo_model, _yolo_loading
@@ -149,6 +170,80 @@ def _check_insightface_age(np_array) -> Optional[float]:
         return None
 
 
+# ==================== 🧠 MIVOLO (3. bağımsız yaş kaynağı - OPSİYONEL) ====================
+# DeepFace ve InsightFace sadece yüze bakıyor; MiVOLO yüz + vücudu birlikte kullandığı
+# için yüz net olmadığında (yandan, uzaktan, filtreli) de tahmin üretebiliyor.
+#
+# ⚠️ VARSAYILAN KAPALI (MIVOLO_ENABLED=0). Kapalıyken bu blok hiç çalışmaz, ne paket
+#    ne ağırlık aranır - yani mevcut kurulum hiçbir şekilde etkilenmez.
+# ⚠️ Açmadan önce: (1) `pip install mivolo timm` (2) ağırlıkları MIVOLO_CHECKPOINT ve
+#    MIVOLO_DETECTOR_WEIGHTS yollarına koy (3) LİSANSI DOĞRULA - ticari kullanım kısıtlı olabilir.
+_mivolo_predictor = None
+_mivolo_loading = False
+_mivolo_unavailable = False  # bir kez başarısız olduysa her istekte tekrar denemeyelim
+
+
+def get_mivolo_predictor():
+    """Thread-safe lazy load MiVOLO. Kapalıysa/yüklenemezse None döner (sessizce)."""
+    global _mivolo_predictor, _mivolo_loading, _mivolo_unavailable
+
+    if not MIVOLO_ENABLED or _mivolo_unavailable:
+        return None
+
+    if _mivolo_loading:
+        while _mivolo_loading and _mivolo_predictor is None:
+            time.sleep(0.1)
+        return _mivolo_predictor
+
+    if _mivolo_predictor is None:
+        _mivolo_loading = True
+        logger.info("🧠 Loading MiVOLO age model...")
+        try:
+            from mivolo.predictor import Predictor
+
+            class _Cfg:
+                detector_weights = MIVOLO_DETECTOR_WEIGHTS
+                checkpoint = MIVOLO_CHECKPOINT
+                device = os.getenv("MIVOLO_DEVICE", "cpu")
+                with_persons = True
+                disable_faces = False
+                draw = False
+
+            _mivolo_predictor = Predictor(_Cfg())
+            logger.info("✅ MiVOLO loaded successfully")
+        except Exception as e:
+            _mivolo_unavailable = True
+            logger.error(f"❌ MiVOLO loading failed, 3. yaş kaynağı devre dışı: {e}")
+            _mivolo_predictor = None
+        finally:
+            _mivolo_loading = False
+
+    return _mivolo_predictor
+
+
+def _check_mivolo_age(np_array) -> Optional[float]:
+    """
+    MiVOLO ile yaş tahmini (yüz + vücut). Kapalıysa/yüz bulunamazsa None.
+
+    Birden fazla kişi varsa EN KÜÇÜK yaş döner: amaç çocuk kaçırmamak.
+    """
+    try:
+        predictor = get_mivolo_predictor()
+        if predictor is None:
+            return None
+
+        # MiVOLO BGR bekliyor (OpenCV konvansiyonu), np_array RGB
+        bgr = np_array[:, :, ::-1]
+        detected, _ = predictor.recognize(bgr)
+        ages = [a for a in (getattr(detected, "ages", None) or []) if a is not None]
+        if not ages:
+            return None
+        return float(min(ages))
+    except Exception as e:
+        logger.warning(f"⚠️ [MIVOLO] Detection failed: {e}")
+        return None
+
+
 # ==================== 🔥 FALCONSAI NSFW CLASSIFIER (2. bağımsız kaynak) ====================
 # Sadece sensitivity="high" (profil fotoğrafı / story) durumunda NudeNet'e ek olarak
 # çalışır - NudeNet'in kaçırdığı içerikleri yakalamak için OR mantığıyla eklenir.
@@ -220,6 +315,9 @@ _openai_client = None
 _openai_client_loading = False
 
 OPENAI_SEXUAL_THRESHOLD = 0.5  # "sexual" skoru bu eşiği geçerse üçüncü kaynak da unsafe der
+# "sexual/minors" için çok daha düşük eşik: bu kategoride yanlış negatifin maliyeti
+# yanlış pozitifin maliyetinden kıyaslanamayacak kadar yüksek.
+OPENAI_MINORS_THRESHOLD = float(os.getenv("OPENAI_MINORS_THRESHOLD", "0.2"))
 
 def get_openai_moderation_client():
     """🔥 Thread-safe lazy load OpenAI client (moderation endpoint ücretsiz)"""
@@ -249,17 +347,36 @@ def get_openai_moderation_client():
     return _openai_client
 
 
+def _cat(obj, attr: str, key: str, default=None):
+    """omni-moderation kategorilerini hem attribute hem dict erişimiyle okur.
+
+    SDK 'sexual/minors' alanını Python'da 'sexual_minors' olarak veriyor; eski/yeni
+    sürüm farklarında patlamamak için ikisini de deniyoruz.
+    """
+    value = getattr(obj, attr, None)
+    if value is None:
+        try:
+            value = obj[key]
+        except Exception:
+            value = default
+    return default if value is None else value
+
+
 def _check_openai_moderation(image: "Image.Image"):
     """
     OpenAI omni-moderation-latest ile görseli sınıflandırır (ücretsiz endpoint).
 
+    'sexual' YANINDA 'sexual/minors' kategorisi de okunur: reşit olmayan içerik
+    burada ayrı bir sinyal ve DAİMA engelleme sebebi (skoru düşük olsa bile
+    kategori True geldiyse geçilmez).
+
     Returns:
-        (is_nsfw: bool, sexual_score: float)
+        (is_nsfw: bool, sexual_score: float, minors_flagged: bool)
     """
     try:
         client = get_openai_moderation_client()
         if client is None:
-            return False, 0.0
+            return False, 0.0, False
 
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=90)
@@ -272,13 +389,21 @@ def _check_openai_moderation(image: "Image.Image"):
             ]
         )
         result = response.results[0]
-        sexual_score = result.category_scores.sexual
-        is_nsfw = bool(result.categories.sexual) or sexual_score > OPENAI_SEXUAL_THRESHOLD
+        sexual_score = float(_cat(result.category_scores, "sexual", "sexual", 0.0) or 0.0)
+        minors_score = float(_cat(result.category_scores, "sexual_minors", "sexual/minors", 0.0) or 0.0)
+        minors_flagged = bool(_cat(result.categories, "sexual_minors", "sexual/minors", False))
 
-        return is_nsfw, sexual_score
+        is_nsfw = (
+            bool(_cat(result.categories, "sexual", "sexual", False))
+            or sexual_score > OPENAI_SEXUAL_THRESHOLD
+            or minors_flagged
+            or minors_score > OPENAI_MINORS_THRESHOLD
+        )
+
+        return is_nsfw, max(sexual_score, minors_score), (minors_flagged or minors_score > OPENAI_MINORS_THRESHOLD)
     except Exception as e:
         logger.warning(f"⚠️ [OPENAI_MODERATION] Detection failed: {e}")
-        return False, 0.0
+        return False, 0.0, False
 
 
 async def warmup_nudenet():
@@ -305,14 +430,66 @@ class ContentModerationResponse(BaseModel):
     # kullanıcıya "kendinizi göstermiyorsunuz" uyarısı gitmemeli.
     has_person: Optional[bool] = None  # only meaningful when gender=1
 
+    # ⬇️ ADDITIVE ALANLAR - eski tüketiciler bunları okumuyor, varsayılanları None.
+    # underage_detected: yaş sinyali (yaş modelleri VEYA OpenAI sexual/minors)
+    # block_reason: "underage" | "nudity" | None - engelin SEBEBİ
+    # checked: False = analiz yapılamadı (görüntü bozuk, model hatası, servis arızası).
+    #          Ana API bunu "güvenli" saymak yerine insan incelemesine düşürmeli.
+    underage_detected: Optional[bool] = None
+    age_estimates: Optional[Dict[str, Optional[float]]] = None
+    block_reason: Optional[str] = None
+    checked: Optional[bool] = None
+
 # ==================== CORE PROCESSING FUNCTIONS ====================
+def decide_underage(age_estimates: dict, age_threshold: int, age_policy: str):
+    """
+    Yaş kaynaklarından karar üretir. SAF FONKSİYON - test edilebilir olsun diye ayrı.
+
+    age_estimates: {"deepface": 22.0, "insightface": None, "mivolo": 15.0} gibi;
+                   None = o kaynak yüz bulamadı / çalışmadı.
+    age_policy:
+      "any"  → kaynaklardan biri bile eşik altı derse underage (profil/story)
+      "dual" → DeepFace VE InsightFace ikisi birden demeli (görüşme içi, eski davranış)
+
+    Returns: (underage: bool, flagged_sources: list, answered_sources: list)
+    """
+    flagged = [name for name, value in age_estimates.items()
+               if value is not None and value < age_threshold]
+    answered = [name for name, value in age_estimates.items() if value is not None]
+
+    if age_policy == "any":
+        underage = len(flagged) >= 1
+    else:
+        underage = ("deepface" in flagged and "insightface" in flagged)
+
+    return underage, flagged, answered
+
+
+def _result(image_size_kb, nudity_detected, confidence_score, detection_details,
+            has_person, underage_detected=None, age_estimates=None, block_reason=None,
+            checked=True):
+    """Pipeline sonucu. Alanlar ADDITIVE: eski tüketiciler ilk beşini okumaya devam eder."""
+    return {
+        "image_size_kb": image_size_kb,
+        "nudity_detected": nudity_detected,
+        "confidence_score": confidence_score,
+        "detection_details": detection_details,
+        "has_person": has_person,
+        "underage_detected": underage_detected,
+        "age_estimates": age_estimates,
+        "block_reason": block_reason,
+        "checked": checked,
+    }
+
+
 def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "normal", gender: int = None):
     """
     🔥 OPTIMIZED: In-memory NudeNet detection + 18+ Age Verification + Person Detection
     
-    ⚠️⚠️⚠️ CHILD SAFETY: 18 YAŞ ALTI TESPİT EDİLİRSE NOT SAFE! ⚠️⚠️⚠️
-    - Bebek, çocuk, teenager → NOT SAFE (nudity_detected=True)
-    - 18 yaş altı herhangi bir kişi → NOT SAFE
+    ⚠️⚠️⚠️ CHILD SAFETY: yaş eşiği altı tespit edilirse NOT SAFE! ⚠️⚠️⚠️
+    - Profil/story ("high"): DeepFace / InsightFace / (opsiyonel) MiVOLO kaynaklarından
+      HERHANGİ BİRİ eşik altı derse + OpenAI sexual/minors sinyali → NOT SAFE
+    - Görüşme içi ("normal"/"low"): DeepFace VE InsightFace ikisi birden demeli (değişmedi)
     
     🧍 PERSON DETECTION (YOLO):
     - gender=1 ise YOLO person detection aktif
@@ -323,27 +500,29 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
     - NudeNet OR Falconsai OR OpenAI Moderation → nudity_detected=True
 
     Sensitivity modes:
-    - "high": Profil fotoğrafı/story için - nudity threshold: 0.45, yaş threshold: 20
-    - "normal": Video call için - nudity threshold: 0.6, yaş threshold: 18
-    - "low": Daha toleranslı - nudity threshold: 0.75, yaş threshold: 18
+    - "high": Profil/story - nudity 0.45, yaş AGE_THRESHOLD_HIGH, kural "any"
+    - "normal": Video call - nudity 0.6, yaş AGE_THRESHOLD_CALL, kural "dual"
+    - "low": Toleranslı - nudity 0.75, yaş AGE_THRESHOLD_CALL, kural "dual"
     
-    Returns: (image_size_kb, nudity_detected, confidence_score, detection_details, has_person)
+    Returns: _result() dict - bkz. o fonksiyonun alanları
     """
     start_time = time.time()
     
     # Hassasiyet ayarlarını belirle
     if sensitivity == "high":
         nudity_threshold = 0.45
-        age_threshold = 16  # Profil/story için: 16 yaş altı ret
-        logger.info("🔍 HIGH sensitivity mode: nudity_threshold=0.45, age_threshold=16")
+        age_threshold = AGE_THRESHOLD_HIGH
+        age_policy = "any"    # kaynaklardan biri bile eşik altı derse şüpheli
     elif sensitivity == "low":
         nudity_threshold = 0.75
-        age_threshold = 16
-        logger.info("🔍 LOW sensitivity mode: nudity_threshold=0.75, age_threshold=16")
+        age_threshold = AGE_THRESHOLD_CALL
+        age_policy = "dual"   # görüşme içi: DEĞİŞTİRİLMEDİ (bkz. AGE_THRESHOLD_CALL notu)
     else:  # normal
         nudity_threshold = 0.6
-        age_threshold = 16  # Video call için: 16 yaş altı ret
-        logger.info("🔍 NORMAL sensitivity mode: nudity_threshold=0.6, age_threshold=16")
+        age_threshold = AGE_THRESHOLD_CALL
+        age_policy = "dual"   # görüşme içi: DEĞİŞTİRİLMEDİ
+    logger.info(f"🔍 {sensitivity.upper()} sensitivity: nudity_threshold={nudity_threshold}, "
+                f"age_threshold={age_threshold}, age_policy={age_policy}")
     
     try:
         # Step 1: Decode base64 data (in-memory)
@@ -353,7 +532,7 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
             logger.debug(f"📊 Image decoded: {image_size_kb:.1f} KB")
         except Exception as e:
             logger.error(f"❌ Base64 decode error: {e}")
-            return 0.0, False, 0.0, "Base64 decode failed", None
+            return _result(0.0, False, 0.0, "Base64 decode failed", None, checked=False)
         
         # Step 2: PIL Image oluştur (hem NudeNet hem DeepFace için)
         try:
@@ -383,7 +562,7 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
             np_array = np.array(image)
         except Exception as e:
             logger.error(f"❌ Image loading error: {e}")
-            return image_size_kb, False, 0.0, f"Image load failed: {str(e)}", None
+            return _result(image_size_kb, False, 0.0, f"Image load failed: {str(e)}", None, checked=False)
         
         # ========== YOLO PERSON DETECTION (sadece gender=1 için) ==========
         yolo_has_person = False
@@ -470,13 +649,26 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
         except Exception as e:
             logger.warning(f"⚠️ [AGE_CHECK] InsightFace age detection failed: {e}")
 
-        # ⚠️ CRITICAL: Sadece iki SDK de bağımsız olarak eşik altı yaş tespit ederse underage kabul et
-        deepface_flags_underage = deepface_age is not None and deepface_age < age_threshold
-        insightface_flags_underage = insightface_age is not None and insightface_age < age_threshold
+        # 🧠 3. kaynak (MiVOLO) - sadece profil/story ve sadece açıksa
+        mivolo_age = None
+        if sensitivity == "high" and MIVOLO_ENABLED:
+            try:
+                mivolo_age = _check_mivolo_age(np_array)
+                if mivolo_age is not None:
+                    logger.info(f"📊 [AGE_CHECK] MiVOLO estimated age: {mivolo_age}")
+            except Exception as e:
+                logger.warning(f"⚠️ [AGE_CHECK] MiVOLO age detection failed: {e}")
 
-        if deepface_flags_underage and insightface_flags_underage:
-            underage_detected = True
-            age_details = f"UNDERAGE DETECTED (dual-verified): DeepFace={deepface_age}, InsightFace={insightface_age} (< {age_threshold})"
+        age_estimates = {"deepface": deepface_age, "insightface": insightface_age, "mivolo": mivolo_age}
+        underage_detected, flagged_sources, answered_sources = decide_underage(
+            age_estimates, age_threshold, age_policy
+        )
+
+        if underage_detected:
+            estimate_text = ", ".join(f"{name}={age_estimates[name]}" for name in answered_sources)
+            verification = "any-source" if age_policy == "any" else "dual-verified"
+            age_details = (f"UNDERAGE DETECTED ({verification}): {estimate_text} "
+                           f"(flagged: {', '.join(flagged_sources)} < {age_threshold})")
             logger.warning(f"🚨 [AGE_CHECK] {age_details}")
 
             # Yaş eşiği altı tespit edildi → NOT SAFE!
@@ -488,7 +680,8 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
                 final_has_person = True
             else:
                 final_has_person = False if yolo_ok else None
-            return image_size_kb, True, 1.0, age_details, final_has_person
+            return _result(image_size_kb, True, 1.0, age_details, final_has_person,
+                           underage_detected=True, age_estimates=age_estimates, block_reason="underage")
         elif deepface_age is not None and insightface_age is not None:
             age_details = f"Age OK (dual-checked): DeepFace={deepface_age}, InsightFace={insightface_age}"
             logger.info(f"✅ [AGE_CHECK] {age_details}")
@@ -497,6 +690,7 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
             logger.info(f"⚠️ [AGE_CHECK] {age_details}")
         
         # Step 3: NudeNet ile nudity detection (yaş 18+ onaylandıysa)
+        underage_flagged_by_moderation = False  # OpenAI sexual/minors sinyali
         nudity_detected = False
         confidence_score = 0.0
         detection_details = "No problematic content detected"
@@ -508,8 +702,18 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
             detections = detector.detect(np_array)
             
             # Detection sonuçlarını değerlendir
-            problematic_classes = ['EXPOSED_ANUS', 'EXPOSED_BUTTOCKS', 'EXPOSED_BREAST_F', 
-                                 'EXPOSED_GENITALIA_F', 'EXPOSED_GENITALIA_M']
+            # ⚠️ NudeNet 3.x sınıf isimleri. Buradaki liste v2 isimlerini (EXPOSED_*)
+            # taşıyordu; kurulu sürüm 3.4.2 olduğu için HİÇBİRİ eşleşmiyordu ve
+            # NudeNet pratikte hiç nudity bildirmiyordu. Her iki isim seti de
+            # tutuluyor ki sürüm değişirse tekrar sessizce sağır kalmasın.
+            problematic_classes = {
+                # NudeNet 3.x
+                'ANUS_EXPOSED', 'BUTTOCKS_EXPOSED', 'FEMALE_BREAST_EXPOSED',
+                'FEMALE_GENITALIA_EXPOSED', 'MALE_GENITALIA_EXPOSED',
+                # NudeNet 2.x (geriye dönük)
+                'EXPOSED_ANUS', 'EXPOSED_BUTTOCKS', 'EXPOSED_BREAST_F',
+                'EXPOSED_GENITALIA_F', 'EXPOSED_GENITALIA_M',
+            }
             
             high_confidence_detections = []
             max_confidence = 0.0
@@ -561,7 +765,8 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
                 final_has_person = True
             else:
                 final_has_person = False if yolo_ok else None
-            return image_size_kb, False, 0.0, f"Detection failed: {str(e)}", final_has_person
+            return _result(image_size_kb, False, 0.0, f"Detection failed: {str(e)}", final_has_person,
+                           underage_detected=False, age_estimates=age_estimates, checked=False)
 
         # ========== 🔥 FALCONSAI NSFW (2. bağımsız kaynak) - SADECE "high" sensitivity'de ==========
         # Profil fotoğrafı / story kontrolünde NudeNet'e ek olarak çalışır (OR mantığı).
@@ -586,10 +791,19 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
             # ========== 🔥 OPENAI MODERATION (3. bağımsız kaynak) - SADECE "high" sensitivity'de ==========
             # Ücretsiz endpoint, NudeNet + Falconsai'ye ek üçüncü doğrulayıcı (OR mantığı).
             try:
-                openai_is_nsfw, openai_score = _check_openai_moderation(image)
-                logger.info(f"🔍 [OPENAI_MODERATION] is_nsfw={openai_is_nsfw}, score={openai_score:.2f}")
+                openai_is_nsfw, openai_score, openai_minors = _check_openai_moderation(image)
+                logger.info(f"🔍 [OPENAI_MODERATION] is_nsfw={openai_is_nsfw}, score={openai_score:.2f}, "
+                            f"minors={openai_minors}")
 
-                if openai_is_nsfw:
+                # 🔞 sexual/minors: ayrı ve KOŞULSUZ engelleme sebebi. Yaş modelleri
+                # yüzü göremediğinde bile bu kategori içeriğin kendisinden sinyal veriyor.
+                if openai_minors:
+                    underage_flagged_by_moderation = True
+                    nudity_detected = True
+                    confidence_score = max(confidence_score, openai_score)
+                    detection_details = f"{detection_details} | UNDERAGE DETECTED (OpenAI sexual/minors, score: {openai_score:.2f})"
+                    logger.warning(f"🚨 [OPENAI_MODERATION] sexual/minors flagged (score: {openai_score:.2f})")
+                elif openai_is_nsfw:
                     confidence_score = max(confidence_score, openai_score)
                     if not nudity_detected:
                         # NudeNet ve Falconsai kaçırdı ama OpenAI yakaladı -> OR mantığı
@@ -604,11 +818,20 @@ def _sync_process_image_optimized(image_data_b64: str, sensitivity: str = "norma
         processing_time = (time.time() - start_time) * 1000  # Convert to milliseconds
         logger.info(f"⚡ Content moderation completed in {processing_time:.1f}ms")
         
-        return image_size_kb, nudity_detected, confidence_score, detection_details, has_person
+        if underage_flagged_by_moderation:
+            final_reason = "underage"
+        elif nudity_detected:
+            final_reason = "nudity"
+        else:
+            final_reason = None
+
+        return _result(image_size_kb, nudity_detected, confidence_score, detection_details, has_person,
+                       underage_detected=underage_flagged_by_moderation,
+                       age_estimates=age_estimates, block_reason=final_reason)
         
     except Exception as e:
         logger.error(f"❌ Content moderation general error: {e}")
-        return 0.0, False, 0.0, f"Processing failed: {str(e)}", None
+        return _result(0.0, False, 0.0, f"Processing failed: {str(e)}", None, checked=False)
 
 # ==================== API ENDPOINTS ====================
 @router.post("/detect", response_model=ContentModerationResponse)
@@ -621,9 +844,10 @@ async def detect_nudity(request: ContentModerationRequest):
     🧍 PERSON DETECTION: gender=1 ise YOLO person detection aktif
     
     Sensitivity modes:
-    - "high": Profil fotoğrafı/story için - Daha sıkı kontrol (nudity: 0.45, age: 20)
-    - "normal": Video call için - Standart kontrol (nudity: 0.6, age: 18)
-    - "low": Daha toleranslı kontrol (nudity: 0.75, age: 18)
+    - "high": Profil fotoğrafı/story - nudity 0.45, yaş AGE_THRESHOLD_HIGH (varsayılan 18),
+              kural "any" (tek kaynak bile eşik altı derse şüpheli)
+    - "normal": Video call - nudity 0.6, yaş AGE_THRESHOLD_CALL (16), kural "dual"
+    - "low": Toleranslı - nudity 0.75, yaş AGE_THRESHOLD_CALL (16), kural "dual"
     
     Gender parameter:
     - gender=1: YOLO person detection aktif, has_person döner (NudeNet OR YOLO)
@@ -640,14 +864,20 @@ async def detect_nudity(request: ContentModerationRequest):
         import asyncio
         loop = asyncio.get_event_loop()
         
-        image_size_kb, nudity_detected, confidence_score, detection_details, has_person = await loop.run_in_executor(
+        outcome = await loop.run_in_executor(
             content_moderation_pool, 
             _sync_process_image_optimized,
             request.image_data,
             request.sensitivity,
             request.gender  # ⚡ Gender parametresi eklendi
         )
-        
+
+        nudity_detected = outcome["nudity_detected"]
+        confidence_score = outcome["confidence_score"]
+        detection_details = outcome["detection_details"]
+        has_person = outcome["has_person"]
+        image_size_kb = outcome["image_size_kb"]
+
         processing_time_ms = (time.time() - start_time) * 1000
         
         response = ContentModerationResponse(
@@ -657,7 +887,11 @@ async def detect_nudity(request: ContentModerationRequest):
             processing_time_ms=processing_time_ms,
             image_size_kb=image_size_kb,
             sensitivity_used=request.sensitivity,
-            has_person=has_person  # ⚡ Person detection sonucu
+            has_person=has_person,  # ⚡ Person detection sonucu
+            underage_detected=outcome.get("underage_detected"),
+            age_estimates=outcome.get("age_estimates"),
+            block_reason=outcome.get("block_reason"),
+            checked=outcome.get("checked", True)
         )
         
         # Log result
@@ -677,7 +911,8 @@ async def detect_nudity(request: ContentModerationRequest):
             processing_time_ms=(time.time() - start_time) * 1000,
             image_size_kb=0.0,
             sensitivity_used=request.sensitivity,
-            has_person=None  # değerlendirilemedi → ana API uyarı üretmez
+            has_person=None,  # değerlendirilemedi → ana API uyarı üretmez
+            checked=False     # analiz yapılamadı → ana API insan incelemesine düşürsün
         )
 
 @router.get("/health")
